@@ -834,6 +834,10 @@ Class RestComponent extends Component {
 			? 'error'
 			: 'ok';
 
+		if (true === @$this->settings['willPaginate']) {
+			$data = $this->willPaginate($data);
+        }
+
 		if (false === ($embed = @$this->settings['actions'][$this->Controller->action]['embed'])) {
 			$response = $data;
 		} else {
@@ -991,4 +995,24 @@ Class RestComponent extends Component {
 		$this->shutdown($this->Controller);
 		die($encoded);
 	}
+
+	public function willPaginate($data) {
+		$Controller =& $this->Controller;
+		$action = $Controller->action;
+		$modelClass = $Controller->modelClass;
+		$extract = (array)@$this->settings['actions'][$action]['extract'];
+		$key = Inflector::tableize($modelClass);
+		if (in_array($key, array_values($extract))) {
+			if (array_key_exists($modelClass, $Controller->params['paging'])) {
+				$page = $Controller->params['paging'][$modelClass]['page'];
+				$total = $Controller->params['paging'][$modelClass]['count'];
+				$per_page = $Controller->params['paging'][$modelClass]['limit'];
+				$models = $data[$key];
+				$data = compact('models', 'page', 'total', 'per_page');
+			} else {
+				$data = $data[$key];
+			}
+		}
+		return $data;
+    }
 }
