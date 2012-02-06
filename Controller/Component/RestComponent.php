@@ -846,7 +846,7 @@ Class RestComponent extends RequestHandlerComponent {
 		$Controller = $this->Controller;
 		$action = $this->controllerAction;
 		$modelClass = $Controller->modelClass;
-		$extract = (array)@$this->actions[$action]['extract'];
+		$extract = (array) $this->getActionSetting('extract');
 		$key = Inflector::tableize($modelClass);
 		if (in_array($key, array_values($extract))) {
 			if (isset($Controller->params['paging']) && array_key_exists($modelClass, $Controller->params['paging'])) {
