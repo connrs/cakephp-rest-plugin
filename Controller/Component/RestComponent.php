@@ -668,7 +668,7 @@ Class RestComponent extends RequestHandlerComponent {
 	 *
 	 * @return array
 	 */
-	public function response ($data = array()) {
+	public function response($data = array()) {
 		$feedback = $this->getFeedBack(true);
 
 		$hasErrors           = count(@$this->_feedback['error']);
@@ -843,8 +843,8 @@ Class RestComponent extends RequestHandlerComponent {
 	}
 
 	public function paginate($data) {
-		$Controller =& $this->Controller;
-		$action = $Controller->action;
+		$Controller = $this->Controller;
+		$action = $this->controllerAction;
 		$modelClass = $Controller->modelClass;
 		$extract = (array)@$this->actions[$action]['extract'];
 		$key = Inflector::tableize($modelClass);
@@ -858,6 +858,10 @@ Class RestComponent extends RequestHandlerComponent {
 			} else {
 				$data = $data[$key];
 			}
+		} elseif (in_array($modelClass, array_values($extract))) {
+			$_data = $data[$modelClass];
+			unset($data[$modelClass]);
+			$data += $_data;
 		}
 		return $data;
 	}
