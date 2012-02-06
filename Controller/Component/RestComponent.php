@@ -1,34 +1,24 @@
 <?php
-Class RestComponent extends Component {
-	public $codes = array(
-		200 => 'OK',
-		400 => 'Bad Request',
-		401 => 'Unauthorized',
-		402 => 'Payment Required',
-		403 => 'Forbidden',
-		404 => 'Not Found',
-		405 => 'Method Not Allowed',
-		406 => 'Not Acceptable',
-		407 => 'Proxy Authentication Required',
-		408 => 'Request Time-out',
-		500 => 'Internal Server Error',
-		501 => 'Not Implemented',
-		502 => 'Bad Gateway',
-		503 => 'Service Unavailable',
-		504 => 'Gateway Time-out',
-	);
-
+App::uses('RequestHandlerComponent', 'Controller/Component');
+App::uses('RestCredentials', 'Rest.Lib');
+Class RestComponent extends RequestHandlerComponent {
 	public $Controller;
-	public $postData;
+	public $controllerAction;
 
+	protected $jsonCallbackKeys = array('jsoncallback', 'callback');
 	protected $_RestLog;
 	protected $_View;
-	protected $_logData     = array();
-	protected $_feedback    = array();
-	protected $_credentials = array();
-	protected $_aborting    = false;
+	protected $_logData = array();
+	protected $_feedback = array();
+	protected $_aborting = false;
 
-	public $settings = array(
+	/**
+	 * Sensible defaults 
+	 * 
+	 * @var array
+	 * @access public
+	 */
+	public $__defaultSettings = array(
 		// Component options
 		'callbacks' => array(
 			'cbRestlogBeforeSave' => 'restlogBeforeSave',
@@ -130,75 +120,64 @@ Class RestComponent extends Component {
 		),
 		'debug' => 0,
 		'onlyActiveWithAuth' => false,
-		'catchredir' => false,
+		'paginate' => false
 	);
+	public $callbacks;
+	public $extensions;
+	public $viewsFromPlugin;
+	public $skipControllers;
+	public $auth;
+	public $exposeVars;
+	public $defaultVars;
+	public $log;
+	public $meta;
+	public $ratelimit;
+	public $version;
+	public $actions;
+	public $debug;
+	public $onlyActiveWithAuth;
+	public $paginate;
 
 	/**
 	 * Should the rest plugin be active?
 	 *
 	 * @var string
 	 */
-	public $isActive = null;
+	protected $isRestful = null;
 
 	public function __construct(ComponentCollection $collection, $settings = array()) {
-		$_settings = $this->settings;
+		$this->Controller = $collection->getController();
+		$this->controllerAction = $this->Controller->action;
+		$settings = $this->initializeSettings($settings);
+
+		parent::__construct($collection, $settings);
+		$this->addInputType('json', array(array($this, 'unrootModelData'), $this->Controller->modelClass));
+	}
+
+	public function initializeSettings($settings) {
+		$_settings = $this->__defaultSettings;
 		if (is_array($config = Configure::read('Rest.settings'))) {
 			$_settings = Set::merge($_settings, $config);
 		}
-		$settings = Set::merge($_settings, $settings);
-
-		parent::__construct($collection, $settings);
+		return Set::merge($_settings, $settings);
 	}
 
 	public function initialize (&$Controller) {
-		$this->Controller = $Controller;
-
-		if (!$this->isActive()) {
+		parent::initialize($Controller);
+		if (!$this->isRestful()) {
 			return;
 		}
 
-		// Control Debug
-		$this->settings['debug'] = (int)$this->settings['debug'];
-		Configure::write('debug', $this->settings['debug']);
-
-		// Set credentials
-		$this->credentials(true);
-
-		// Prepare log
-		$this->log(array(
-			'controller' => $this->Controller->name,
-			'action' => $this->Controller->action,
-			'model_id' => @$this->Controller->passedArgs[0]
-				? @$this->Controller->passedArgs[0]
-				: 0,
-			'ratelimited' => 0,
-			'requested' => date('Y-m-d H:i:s'),
-			'ip' => $_SERVER['REMOTE_ADDR'],
-			'httpcode' => 200,
-		));
-
-		// Validate & Modify Post
-		$this->postData = $this->_modelizePost($this->Controller->request->data);
-		if ($this->postData === false) {
-			return $this->abort('Invalid post data');
-		}
-
-		// SSL
-		if (!empty($this->settings['auth']['requireSecure'])) {
-			if (!isset($this->Controller->Security)
-				|| !is_object($this->Controller->Security)) {
-				return $this->abort('You need to enable the Security component first');
-			}
-			$this->Controller->Security->requireSecure($this->settings['auth']['requireSecure']);
-		}
-
-		// Set content-headers
-		$this->headers();
+		$this->setDebugLevel();
+		$this->Credentials = new RestCredentials($this, array('auth' => $this->auth, 'ratelimit' => $this->ratelimit));
+		$this->initializeLog();
+		$this->initializeSecurity();
+		$this->setExtensionForAjaxRequest();
 	}
 
 	/**
 	 * Catch & fire callbacks. You can map callbacks to different places
-	 * using the value parts in $this->settings['callbacks'].
+	 * using the value parts in $this->callbacks.
 	 * If the resolved callback is a string we assume it's in
 	 * the controller.
 	 *
@@ -206,11 +185,12 @@ Class RestComponent extends Component {
 	 * @param array  $arguments
 	 */
 	public function  __call ($name, $arguments) {
-		if (!isset($this->settings['callbacks'][$name])) {
-			return $this->abort('Function does not exist: '. $name);
+		if (!isset($this->callbacks[$name])) {
+			$message = __('Function does not exist: %s', $name);
+			throw new BadRequestException($message);
 		}
 
-		$cb = $this->settings['callbacks'][$name];
+		$cb = $this->callbacks[$name];
 		if (is_string($cb)) {
 			$cb = array($this->Controller, $cb);
 		}
@@ -228,7 +208,7 @@ Class RestComponent extends Component {
 	 * @param <type> $Controller
 	 */
 	public function shutdown (&$Controller) {
-		if (!$this->isActive()) {
+		if (!$this->isRestful()) {
 			return;
 		}
 
@@ -246,18 +226,19 @@ Class RestComponent extends Component {
 	 * @return <type>
 	 */
 	public function startup (&$Controller) {
-		if (!$this->isActive()) {
+		parent::startup($Controller);
+		if (!$this->isRestful()) {
 			return;
 		}
 
 		// Rate Limit
-		if (@$this->settings['ratelimit']['enable']) {
-			$credentials = $this->credentials();
-			$class		 = @$credentials['class'];
-			if (!$class) {
+		if ($this->ratelimit['enable']) {
+			$credentials = $this->Credentials->get();
+			if (!array_key_exists('class', $credentials)) {
 				$this->warning('Unable to establish class');
 			} else {
-				list($time, $max) = $this->settings['ratelimit']['classlimits'][$class];
+				$class = $credentials['class'];
+				list($time, $max) = $this->ratelimit['classlimits'][$class];
 
 				$cbMax = $this->cbRestRatelimitMax($credentials);
 				if ($cbMax) {
@@ -265,29 +246,23 @@ Class RestComponent extends Component {
 				}
 
 				if (true !== ($count = $this->ratelimit($time, $max))) {
-					$msg = sprintf(
-						'You have reached your ratelimit (%s is more than the allowed %s requests in %s)',
-						$count,
-						$max,
-						str_replace('-', '', $time)
-					);
+					$message = __('You have reached your ratelimit (%s is more than the allowed %s requests in %s)', $count, $max, str_replace('-', '', $time));
 					$this->log('ratelimited', 1);
-					return $this->abort($msg);
+					throw new TooManyRequestsException($message, 429);
 				}
 			}
 		}
-		if ($this->settings['viewsFromPlugin']) {
+		if ($this->viewsFromPlugin) {
 			// Setup the controller so it can use
 			// the view inside this plugin
 			$this->Controller->viewClass = 'Rest.' . $this->View(false);
 		}
 
 		// Dryrun
-		if (($this->Controller->_restMeta = @$_POST['meta'])) {
-			if (@$this->Controller->_restMeta['dryrun']) {
-				$this->warning('Dryrun active, not really executing your command');
-				$this->abort();
-			}
+		if(array_key_exists('meta', $_POST)) {
+			$this->Controller->_restMeta['dryrun'] = $_POST['meta'];
+			$message = __('Dryrun active, not really executing your command.');
+			throw new OKException($message, 200);
 		}
 	}
 
@@ -300,36 +275,21 @@ Class RestComponent extends Component {
 	 * @return <type>
 	 */
 	public function beforeRender (&$Controller) {
-		if (!$this->isActive()) return;
+		parent::beforeRender($Controller);
+		if (!$this->isRestful()) {
+			return;
+		}
 
-		if (false === ($extract = @$this->settings['actions'][$this->Controller->action]['extract'])) {
+		if (!$extract = $this->getActionSetting('extract')) {
 			$data = $this->Controller->viewVars;
 		} else {
-			$data = $this->inject(
-				(array)$extract,
-				$this->Controller->viewVars
-			);
+			$data = $this->inject((array)$extract, $this->Controller->viewVars);
 		}
 
 		$response = $this->response($data);
 
 		$this->Controller->set(compact('response'));
 
-		// if a callback function is requested, pass the callback name to the controller
-		// responds if following query parameters present: jsoncallback, callback
-		$callback = false;
-		$json_callback_keys = array('jsoncallback', 'callback');
-		foreach ($json_callback_keys as $key) {
-			if (array_key_exists($key, $this->Controller->params['url'])) {
-				$callback = $this->Controller->params['url'][$key];
-			}
-		}
-		if ($callback) {
-			if (preg_match('/\W/', $callback)) {
-				return $this->abort('Prevented request. Your callback is vulnerable to XSS attacks. ');
-			}
-			$this->Controller->set('callbackFunc', $callback);
-		}
 	}
 
 	/**
@@ -353,69 +313,31 @@ Class RestComponent extends Component {
 	}
 
 	/**
-	 * Prepares REST data for cake interaction
-	 *
-	 * @param <type> $data
-	 * @return <type>
-	 */
-	protected function _modelizePost (&$data) {
-		if (!is_array($data)) {
-			return $data;
-		}
-
-		// Don't throw errors if data is already modelized
-		// f.e. sending a serialized FormHelper form via ajax
-		if (isset($data[$this->Controller->modelClass])) {
-			$data = $data[$this->Controller->modelClass];
-		}
-
-		// Protected against Saving multiple models in one post
-		// while still allowing mass-updates in the form of:
-		// $this->request->data[1][field] = value;
-		if (Set::countDim($data) === 2) {
-			if (!$this->numeric($data)) {
-				return $this->error('2 dimensional can only begin with numeric index');
-			}
-		} else if (Set::countDim($data) !== 1) {
-			return $this->error('You may only send 1 dimensional posts');
-		}
-
-		// Encapsulate in Controller Model
-		$data = array(
-			$this->Controller->modelClass => $data,
-		);
-
-		return $data;
-	}
-
-	/**
 	 * Works together with Logging to ratelimit incomming requests by
 	 * identfield
 	 *
 	 * @return <type>
 	 */
-	public function ratelimit ($time, $max) {
+	public function ratelimit($time, $max) {
 		// No rate limit active
-		if (empty($this->settings['ratelimit'])) {
+		if (empty($this->ratelimit)) {
 			return true;
 		}
 
 		// Need logging
-		if (empty($this->settings['log']['model'])) {
-			return $this->abort(
-				'Logging is required for any ratelimiting to work'
-			);
+		if (empty($this->log['model'])) {
+			$message = __('Logging is required for any ratelimiting to work.');
+			throw new InternalErrorException($message);
 		}
 
 		// Need identfield
-		if (empty($this->settings['ratelimit']['identfield'])) {
-			return $this->abort(
-				'Need a identfield or I will not know what to ratelimit on'
-			);
+		if (empty($this->ratelimit['identfield'])) {
+			$message = __('Need an identfield or I will not know what to ratelimit on');
+			throw new InternalErrorException($message);
 		}
 
-		$userField = $this->settings['ratelimit']['identfield'];
-		$userId	= $this->credentials($userField);
+		$userField = $this->ratelimit['identfield'];
+		$userId = $this->Credentials->get($userField);
 
 		$this->cbRestlogBeforeFind();
 		if ($userId) {
@@ -429,7 +351,7 @@ Class RestComponent extends Component {
 			));
 		} else {
 			// IP based rate limiting
-			$max  = $this->settings['ratelimit']['ip_limit'];
+			$max  = $this->ratelimit['ip_limit'];
 			$logs = $this->RestLog()->find('list', array(
 				'fields' => array('id', $userField),
 				'conditions' => array(
@@ -455,8 +377,8 @@ Class RestComponent extends Component {
 	 */
 	public function RestLog () {
 		if (!$this->_RestLog) {
-			$this->_RestLog = ClassRegistry::init($this->settings['log']['model']);
-			$this->_RestLog->restLogSettings = $this->settings['log'];
+			$this->_RestLog = ClassRegistry::init($this->log['model']);
+			$this->_RestLog->restLogSettings = $this->log;
 			$this->_RestLog->restLogSettings['controller'] = $this->Controller->name;
 			$this->_RestLog->Encoder = $this->View(true);
 		}
@@ -474,10 +396,10 @@ Class RestComponent extends Component {
 	 *
 	 * @return boolean
 	 */
-	public function log ($key, $val = null) {
+	public function log($key, $val = null) {
 		// Write log
 		if ($key === true && func_num_args() === 1) {
-			if (!@$this->settings['log']['model']) {
+			if (empty($this->log['model'])) {
 				return true;
 			}
 
@@ -514,68 +436,18 @@ Class RestComponent extends Component {
 	}
 
 	/**
-	 * Sets or returns credentials as found in the 'Authorization' header
-	 * sent by the client.
-	 *
-	 * Have your client set a header like:
-	 * Authorization: TRUEREST username=john&password=xxx&apikey=247b5a2f72df375279573f2746686daa<
-	 * http://docs.amazonwebservices.com/AmazonS3/2006-03-01/index.html?RESTAuthentication.html
-	 *
-	 * credentials(true) sets credentials
-	 * credentials() returns full array
-	 * credentials('username') returns username
-	 *
-	 * @param mixed boolean or string $set
-	 *
-	 * @return <type>
+	 * Sets CakePHP debug mode for request based upon debug setting passed through
+	 * from controller. Checks if debug level is set system wide and honours that setting
+	 * 
+	 * @access public
+	 * @return void
 	 */
-	public function credentials ($set = false) {
-		// Return full credentials
-		if ($set === false) {
-			return $this->_credentials;
+	public function setDebugLevel() {
+		if (null === $this->debug) {
+			return;
 		}
 
-		// Set credentials
-		if ($set === true) {
-			if (!empty($_SERVER['HTTP_AUTHORIZATION'])) {
-				$parts = explode(' ', $_SERVER['HTTP_AUTHORIZATION']);
-				$match = array_shift($parts);
-				if ($match !== $this->settings['auth']['keyword']) {
-					return false;
-				}
-				$str = join(' ', $parts);
-				parse_str($str, $this->_credentials);
-
-				if (!isset($this->_credentials[$this->settings['auth']['fields']['class']])) {
-					$this->_credentials[$this->settings['auth']['fields']['class']] = $this->settings['ratelimit']['default'];
-				}
-
-				$this->log(array(
-					'username' => @$this->_credentials[$this->settings['auth']['fields']['username']],
-					'apikey' => $this->_credentials[$this->settings['auth']['fields']['apikey']],
-					'class' => $this->_credentials[$this->settings['auth']['fields']['class']],
-				));
-			}
-
-			return $this->_credentials;
-		}
-
-		// Return 1 field
-		if (is_string($set)) {
-			// First try key as is
-			if (null !== ($val = @$this->_credentials[$set])) {
-				return $val;
-			}
-
-			// Fallback to the mapped key according to authfield settings
-			if (null !== ($val = @$this->_credentials[$this->settings['auth']['fields'][$set]])) {
-				return $val;
-			}
-
-			return null;
-		}
-
-		return $this->abort('credential argument not supported');
+		Configure::write('debug', (int) $this->debug);
 	}
 
 	/**
@@ -587,7 +459,7 @@ Class RestComponent extends Component {
 	 *
 	 * @return array
 	 */
-	public function controllers ($cached = true) {
+	public function controllers($cached = true) {
 		$ckey = sprintf('%s.%s', __CLASS__, __FUNCTION__);
 
 		if (!$cached || !($restControllers = Cache::read($ckey))) {
@@ -596,7 +468,7 @@ Class RestComponent extends Component {
 			$controllers = App::objects('controller', null, false);
 
 			// Unlist some controllers by default
-			foreach ($this->settings['skipControllers'] as $skipController) {
+			foreach ($this->skipControllers as $skipController) {
 				if (false !== ($key = array_search($skipController, $controllers))) {
 					unset($controllers[$key]);
 				}
@@ -634,16 +506,16 @@ Class RestComponent extends Component {
 						$saveVars = array();
 
 						$exposeVars = array_merge(
-							$this->settings['exposeVars']['*'],
-							isset($this->settings['exposeVars'][$action]) ? $this->settings['exposeVars'][$action] : array()
+							$this->exposeVars['*'],
+							isset($this->exposeVars[$action]) ? $this->exposeVars[$action] : array()
 						);
 
 						foreach ($exposeVars as $exposeVar => $example) {
 							if (isset($vars[$exposeVar])) {
 								$saveVars[$exposeVar] = $vars[$exposeVar];
 							} else {
-								if (isset($this->settings['defaultVars'][$action][$exposeVar])) {
-									$saveVars[$exposeVar] = $this->settings['defaultVars'][$action][$exposeVar];
+								if (isset($this->defaultVars[$action][$exposeVar])) {
+									$saveVars[$exposeVar] = $this->defaultVars[$action][$exposeVar];
 								} else {
 									return $this->abort(sprintf(
 										'Rest maintainer needs to set "%s" for %s using ' .
@@ -677,38 +549,32 @@ Class RestComponent extends Component {
 	}
 
 	/**
-	 * Set content-type headers based on extension
-	 *
-	 * @param <type> $ext
-	 *
-	 * @return <type>
+	 * Determine if this action should trigger this component's magic goodness
+	 * 
+	 * @access public
+	 * @return void
 	 */
-	public function headers ($ext = null) {
-		return $this->View(true, $ext)->headers($this->Controller, $this->settings);
-	}
-
-	public function isActive () {
-		if ($this->isActive === null) {
+	public function isRestful () {
+		if ($this->isRestful === null) {
 			if (!isset($this->Controller) || !is_object($this->Controller)) {
 				return false;
 			}
 
-			if ($this->settings['onlyActiveWithAuth'] === true) {
-				$keyword = $this->settings['auth']['keyword'];
-				if ($keyword && strpos(@$_SERVER['HTTP_AUTHORIZATION'], $keyword) === 0) {
-					return $this->isActive = true;
-				} else {
-					return $this->isActive = false;
+			$this->isRestful = false;
+			if ($this->onlyActiveWithAuth === true && !empty($_SERVER['HTTP_AUTHORIZATION'])) {
+				$keyword = $this->auth['keyword'];
+				if ($keyword && strpos($_SERVER['HTTP_AUTHORIZATION'], $keyword) === 0) {
+					$this->isRestful = true;
 				}
+			} elseif (!empty($this->ext) && in_array($this->ext, $this->extensions)) {
+				$this->isRestful = true;
+			} elseif ($this->request->is('ajax')) {
+				$this->isRestful = true;
 			}
-
-			return $this->isActive = in_array(
-				!empty($this->Controller->request->params['ext']) ? $this->Controller->request->params['ext'] : null,
-				$this->settings['extensions']
-			);
 		}
-		return $this->isActive;
+		return $this->isRestful;
 	}
+
 	public function validate ($format, $arg1 = null, $arg2 = null) {
 		$args = func_get_args();
 		if (count($args) > 0) $format = array_shift($args);
@@ -716,6 +582,7 @@ Class RestComponent extends Component {
 		$this->_feedback['error'][] = 'validation: ' . $format;
 		return false;
 	}
+
 	public function error ($format, $arg1 = null, $arg2 = null) {
 		$args = func_get_args();
 		if (count($args) > 0) $format = array_shift($args);
@@ -723,6 +590,7 @@ Class RestComponent extends Component {
 		$this->_feedback[__FUNCTION__][] = $format;
 		return false;
 	}
+
 	public function debug ($format, $arg1 = null, $arg2 = null) {
 		$args = func_get_args();
 		if (count($args) > 0) $format = array_shift($args);
@@ -730,6 +598,7 @@ Class RestComponent extends Component {
 		$this->_feedback[__FUNCTION__][] = $format;
 		return true;
 	}
+
 	public function info ($format, $arg1 = null, $arg2 = null) {
 		$args = func_get_args();
 		if (count($args) > 0) $format = array_shift($args);
@@ -737,6 +606,7 @@ Class RestComponent extends Component {
 		$this->_feedback[__FUNCTION__][] = $format;
 		return true;
 	}
+
 	public function warning ($format, $arg1 = null, $arg2 = null) {
 		$args = func_get_args();
 		if (count($args) > 0) $format = array_shift($args);
@@ -752,7 +622,7 @@ Class RestComponent extends Component {
 	 *
 	 * @return array
 	 */
-	public function getFeedBack ($format = false) {
+	public function getFeedBack($format = false) {
 		if (!$format) {
 			return $this->_feedback;
 		}
@@ -778,7 +648,7 @@ Class RestComponent extends Component {
 	 *
 	 * @return array
 	 */
-	public function inject ($take, $viewVars) {
+	public function inject($take, $viewVars) {
 		$data = array();
 		foreach ($take as $path => $dest) {
 			if (is_numeric($path)) {
@@ -799,53 +669,26 @@ Class RestComponent extends Component {
 	 * @return array
 	 */
 	public function response ($data = array()) {
-		// In case of edit, return what post data was received
-		if (empty($data) && !empty($this->postData)) {
-			$data = $this->postData;
-
-			// In case of add, enrich the postdata with the primary key of the
-			// added record. Nice if you e.g. first create a parent, and then
-			// immediately need the ID to add it's children
-			if (!empty($this->Controller->modelClass)) {
-				$modelClass = $this->Controller->modelClass;
-				if (!empty($data[$modelClass]) && ($Model = @$this->Controller->{$modelClass})) {
-					if (empty($data[$modelClass][$Model->primaryKey]) && $Model->id) {
-						$data[$modelClass][$Model->primaryKey] = $Model->id;
-					}
-				}
-
-				// import validation errors
-				if (($modelErrors = @$this->Controller->{$modelClass}->validationErrors)) {
-					if (is_array($modelErrors)) {
-						$modelErrors = join('; ', $modelErrors);
-					}
-					$this->validate($modelErrors);
-				}
-			}
-
-		}
 		$feedback = $this->getFeedBack(true);
 
 		$hasErrors           = count(@$this->_feedback['error']);
 		$hasValidationErrors = count(@$this->_feedback['validate']);
 
 		$time   = time();
-		$status = ($hasErrors || $hasValidationErrors)
-			? 'error'
-			: 'ok';
+		$status = ($hasErrors || $hasValidationErrors) ? 'error' : 'ok';
 
-		if (true === @$this->settings['willPaginate']) {
-			$data = $this->willPaginate($data);
-        }
+		if ($this->paginate) {
+			$data = $this->paginate($data);
+		}
 
-		if (false === ($embed = @$this->settings['actions'][$this->Controller->action]['embed'])) {
+		if (false === ($embed = @$this->actions[$this->Controller->action]['embed'])) {
 			$response = $data;
 		} else {
 			$response = compact('data');
-		}		
+		}       
 
-		if ($this->settings['meta']['enable']) {
-			$serverKeys = array_flip($this->settings['meta']['requestKeys']);
+		if ($this->meta['enable']) {
+			$serverKeys = array_flip($this->meta['requestKeys']);
 			$server = array_intersect_key($_SERVER, $serverKeys);
 			foreach ($server as $k=>$v) {
 				if ($k === ($lc = strtolower($k))) {
@@ -863,11 +706,11 @@ Class RestComponent extends Component {
 				'time_epoch' => gmdate('U', $time),
 				'time_local' => date('r', $time),
 			);
-			if (!empty($this->settings['version'])) {
-				$response['meta']['version'] = $this->settings['version'];
+			if (!empty($this->version)) {
+				$response['meta']['version'] = $this->version;
 			}
 
-			foreach ($this->settings['auth']['fields'] as $field) {
+			foreach ($this->auth['fields'] as $field) {
 				$response['meta']['credentials'][$field] = $this->credentials($field);
 			}
 		}
@@ -876,7 +719,7 @@ Class RestComponent extends Component {
 			'data_in' => $this->postData,
 			'data_out' => $data,
 		);
-		if ($this->settings['meta']['enable']) {
+		if ($this->meta['enable']) {
 			$dump['meta'] = $response['meta'];
 		}
 		$this->log($dump);
@@ -893,14 +736,14 @@ Class RestComponent extends Component {
 	 * @return mixed object or string
 	 */
 	public function View ($object = true, $ext = null) {
-		if (!$this->isActive()) {
+		if (!$this->isRestful()) {
 			return $this->abort(
 				'Rest not activated. Maybe try correct extension.'
 			);
 		}
 
 		if ($ext === null) {
-			$ext = $this->Controller->request->params['ext'];
+			$ext = $this->ext;
 		}
 
 		$base = Inflector::camelize($ext);
@@ -920,24 +763,11 @@ Class RestComponent extends Component {
 
 			$this->_View = ClassRegistry::init('Rest.' . $className);
 			if (empty($this->_View->params)) {
-				$this->_View->params = $this->Controller->params;
+				$this->_View->params = $this->params;
 			}
 		}
 
 		return $this->_View;
-	}
-
-	public function beforeRedirect (&$Controller, $url, $status = null, $exit = true) {
-		if (@$this->settings['catchredir'] === false) {
-			return;
-		}
-
-		if (!$this->isActive()) {
-			return;
-		}
-		$redirect = true;
-		$this->abort(compact('url', 'status', 'exit', 'redirect'));
-		return false;
 	}
 
 	/**
@@ -983,7 +813,6 @@ Class RestComponent extends Component {
 		}
 		$this->Controller->response->statusCode($code);
 
-		$this->headers();
 		$encoded = $this->View()->encode($this->response($data));
 
 		// Die.. ugly. but very safe. which is what we need
@@ -996,14 +825,31 @@ Class RestComponent extends Component {
 		die($encoded);
 	}
 
-	public function willPaginate($data) {
+	/**
+	 * Ensure that the Security component is active when this component has requireSecure
+	 * set to true.
+	 * 
+	 * @access public
+	 * @return void
+	 */
+	public function initializeSecurity() {
+		if (!empty($this->auth['requireSecure'])) {
+			if (!isset($this->Controller->Security) || !is_object($this->Controller->Security)) {
+				$message = __('You need to enable the Security component first');
+				throw new InternalErrorException($message);
+			}
+			$this->Controller->Security->requireSecure($this->auth['requireSecure']);
+		}
+	}
+
+	public function paginate($data) {
 		$Controller =& $this->Controller;
 		$action = $Controller->action;
 		$modelClass = $Controller->modelClass;
-		$extract = (array)@$this->settings['actions'][$action]['extract'];
+		$extract = (array)@$this->actions[$action]['extract'];
 		$key = Inflector::tableize($modelClass);
 		if (in_array($key, array_values($extract))) {
-			if (array_key_exists($modelClass, $Controller->params['paging'])) {
+			if (isset($Controller->params['paging']) && array_key_exists($modelClass, $Controller->params['paging'])) {
 				$page = $Controller->params['paging'][$modelClass]['page'];
 				$total = $Controller->params['paging'][$modelClass]['count'];
 				$per_page = $Controller->params['paging'][$modelClass]['limit'];
@@ -1014,5 +860,112 @@ Class RestComponent extends Component {
 			}
 		}
 		return $data;
-    }
+	}
+
+	/**
+	 * Create initial log during initialization of RestComponent
+	 * during a restful operation. 
+	 * 
+	 * @access public
+	 * @return void
+	 */
+	public function initializeLog() {
+		$controller = $this->Controller->name;
+		$action = $this->controllerAction;
+		if (isset($this->Controller->passedArgs[0])) {
+			$model_id = $this->Controller->passedArgs[0];
+		} else {
+			$model_id = 0;
+		}
+		$ratelimited = 0;
+		$requested = date('Y-m-d H:i:s');
+		$ip = $_SERVER['REMOTE_ADDR'];
+		$httpcode = 200;
+
+		$this->log(compact('controller', 'action', 'model_id', 'ratelimited', 'requested', 'ip', 'httpcode'));
+	}
+
+	/**
+	 * Get the setting for the current controller action listed in $key 
+	 * 
+	 * @param mixed $key 
+	 * @access public
+	 * @return mixed
+	 */
+	public function getActionSetting($key) {
+		$action = $this->controllerAction;
+		if (array_key_exists($action, $this->actions) && array_key_exists($key, $this->actions[$action])) {
+			return $this->actions[$action][$key];
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * Move any lowercase keys in POST data to a key representing the model. 
+	 * 
+	 * @param mixed $input 
+	 * @param mixed $modelClass 
+	 * @access public
+	 * @return void
+	 */
+	public function unrootModelData($input, $modelClass) {
+		$input = json_decode($input, true);
+		if (!array_key_exists($modelClass, $input)) {
+			$input[$modelClass] = array();
+			foreach ($input as $key => $val) {
+				if (!preg_match('/^[A-Z]{1}/', $key)) {
+					if (!($key == 'created' && $key == 'modified')) {
+						$input[$modelClass][$key] = $val;
+					}
+					unset($input[$key]);
+				}
+			}
+		}
+		return $input;
+	}
+
+	/**
+	 * Sets callbackFunc variable in viewVars when a callback is requested
+	 * and when it is safe (XSS) to do so. The following query params will
+	 * trigger the callback: jsoncallback & callback based upon the public
+	 * class variable $jsonCallbackKeys
+	 * 
+	 * @access public
+	 * @return void
+	 */
+	public function setCallbackResponse() {
+		$callback = false;
+		foreach ($this->jsonCallbackKeys as $key) {
+			if (array_key_exists($key, $this->params['url'])) {
+				$callback = $this->params['url'][$key];
+			}
+		}
+		if ($callback) {
+			// Checks for callback keys which are vulnerable to XSS
+			if (preg_match('/\W/', $callback)) {
+				$message = __('Prevented request. Your callback is vulnerable to XSS attacks.');
+				throw new MethodNotAllowedException($message);
+			}
+			$this->Controller->set('callbackFunc', $callback);
+		}
+	}
+
+	/**
+	 * When the request is extensionless but the request is an AJAX request
+	 * an extension is added to $this->ext dependent upon whether the client
+	 * prefers XML or JSON 
+	 * 
+	 * @access public
+	 * @return void
+	 */
+	public function setExtensionForAjaxRequest() {
+		if (empty($this->ext) && $this->request->is('ajax')) {
+			if ($this->prefers('json')) {
+				$this->ext = 'json';
+			} elseif ($this->prefers('xml')) {
+				$this->ext = 'xml';
+			}
+		}
+	}
 }
