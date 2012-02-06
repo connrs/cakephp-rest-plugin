@@ -1,4 +1,12 @@
 <?php
+/**
+ * Sets or returns credentials as found in the 'Authorization' header
+ * sent by the client.
+ *
+ * Have your client set a header like:
+ * Authorization: TRUEREST username=john&password=xxx&apikey=247b5a2f72df375279573f2746686daa<
+ * http://docs.amazonwebservices.com/AmazonS3/2006-03-01/index.html?RESTAuthentication.html
+ */
 class RestCredentials extends Object {
 	public $auth;
 	public $credentials;
