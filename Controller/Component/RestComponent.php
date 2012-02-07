@@ -650,15 +650,32 @@ Class RestComponent extends RequestHandlerComponent {
 	 */
 	public function inject($take, $viewVars) {
 		$data = array();
+		$_data = array();
+		$magicInsert = array();
 		foreach ($take as $path => $dest) {
-			if (is_numeric($path)) {
-				$path = $dest;
-			}
+			if (preg_match('/.*\.{n}\..*/', $dest)) {
+				$magicInsert[$path] = $dest;
+			} else {
+				if (is_numeric($path)) {
+					$path = $dest;
+				}
 
-			$data = Set::insert($data, $dest, Set::extract($path, $viewVars));
+				$data = Set::insert($data, $dest, Set::extract($path, $viewVars));
+			}
+		}
+		for ($x=0; $x < count($data); $x++) {
+			foreach ($magicInsert as $mPath => $mDest) {
+				$splode = explode('.', $mDest);
+				$root = $splode[0];
+				$key = $splode[2];
+				$extracted = Set::extract($mPath, $viewVars);
+				foreach ($extracted as $y => $extract) {
+					$_data[$root][$y][$key] = $extract;
+				}
+			}
 		}
 
-		return $data;
+		return Set::merge($data, $_data);
 	}
 
 	/**
