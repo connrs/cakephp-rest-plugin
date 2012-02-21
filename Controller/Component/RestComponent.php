@@ -118,7 +118,7 @@ Class RestComponent extends RequestHandlerComponent {
 				'extract' => array(),
 			),
 		),
-		'debug' => 0,
+		'debug' => null,
 		'onlyActiveWithAuth' => false,
 		'paginate' => false
 	);
@@ -931,6 +931,10 @@ Class RestComponent extends RequestHandlerComponent {
 	 * @return void
 	 */
 	public function unrootModelData($input, $modelClass) {
+        if (empty($input)) {
+            return array();
+        }
+
 		$input = json_decode($input, true);
 		if (!array_key_exists($modelClass, $input)) {
 			$input[$modelClass] = array();
