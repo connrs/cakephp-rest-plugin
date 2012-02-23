@@ -252,17 +252,29 @@ Class RestComponent extends RequestHandlerComponent {
                 }
             }
         }
-        if ($this->viewsFromPlugin) {
-            // Setup the controller so it can use
-            // the view inside this plugin
-            $this->Controller->viewClass = 'Rest.' . $this->View(false);
-        }
 
         // Dryrun
         if(array_key_exists('meta', $_POST)) {
             $this->Controller->_restMeta['dryrun'] = $_POST['meta'];
             $message = __('Dryrun active, not really executing your command.');
             throw new OKException($message, 200);
+        }
+    }
+
+    /**
+     * Overrides the template paths in situations where the request is restful 
+     * 
+     * @param mixed $Controller 
+     * @param mixed $type 
+     * @param array $options 
+     * @access public
+     * @return void
+     */
+    public function renderAs($Controller, $type, $options = array()) {
+        parent::renderAs($Controller, $type, $options);
+        if ($this->isRestful()) {
+            $Controller->viewClass = 'Rest.' . $this->getViewClass();
+            App::uses($Controller->viewClass. 'View', 'Rest.View');
         }
     }
 
@@ -745,6 +757,18 @@ Class RestComponent extends RequestHandlerComponent {
     }
 
     /**
+     * Returns the name of the view class 
+     * 
+     * @access public
+     * @return void
+     */
+    public function getViewClass() {
+        $requestExtension = $this->ext;
+        $viewClass = Inflector::camelize($requestExtension);
+        return 'Restful' . $viewClass;
+    }
+
+    /**
      * Returns either string or reference to active View object
      *
      * @param boolean $object
@@ -770,12 +794,13 @@ Class RestComponent extends RequestHandlerComponent {
 
         // Keep 1 instance of the active View in ->_View
         if (!$this->_View) {
-            $className = $base . 'View';
+            $className = $base;
 
             if (!class_exists($className)) {
-                $pluginRoot = dirname(dirname(dirname(__FILE__)));
+                App::uses($className, 'Rest.View');
+                /*$pluginRoot = dirname(dirname(dirname(__FILE__)));
                 $viewFile   = $pluginRoot . '/View/' . $className . '.php';
-                require_once $viewFile;
+                require_once $viewFile;*/
             }
 
             $this->_View = ClassRegistry::init('Rest.' . $className);
